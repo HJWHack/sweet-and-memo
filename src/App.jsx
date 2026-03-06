@@ -1,5 +1,9 @@
 import { useState, useEffect, useCallback, useRef, createContext, useContext } from "react";
 import { supabase } from "./supabase";
+import { loadStripe } from "@stripe/stripe-js";
+import { Elements, PaymentElement, useStripe, useElements } from "@stripe/react-stripe-js";
+
+const stripePromise = loadStripe(import.meta.env.VITE_STRIPE_PUBLISHABLE_KEY);
 
 /* ─────────────────────────── CONSTANTS & DATA ─────────────────────────── */
 const ADMIN_PASS = "dafne2026";
@@ -925,36 +929,89 @@ function CartSidebar({ cart, updateQty, removeItem, close, goCheckout }) {
 }
 
 /* ─────────────────────────── CHECKOUT PAGE ─────────────────────────── */
+function StripePaymentForm({ total, onSuccess, formData, delivery, cart }) {
+  const stripe = useStripe();
+  const elements = useElements();
+  const [processing, setProcessing] = useState(false);
+  const [error, setError] = useState(null);
+
+  const handlePay = async () => {
+    if (!stripe || !elements) return;
+    setProcessing(true);
+    setError(null);
+    const { error: submitError } = await elements.submit();
+    if (submitError) { setError(submitError.message); setProcessing(false); return; }
+
+    const res = await fetch("/api/create-payment-intent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ amount: total }),
+    });
+    const { clientSecret, error: apiError } = await res.json();
+    if (apiError) { setError(apiError); setProcessing(false); return; }
+
+    const { error: confirmError } = await stripe.confirmPayment({
+      elements,
+      clientSecret,
+      confirmParams: { return_url: window.location.href },
+      redirect: "if_required",
+    });
+
+    if (confirmError) {
+      setError(confirmError.message);
+      setProcessing(false);
+    } else {
+      const order = {
+        id: "SM-" + Date.now().toString(36).toUpperCase(),
+        items: cart.map(i => ({ name: i.name, qty: i.qty, price: i.price })),
+        customer: { name: formData.name, email: formData.email, phone: formData.phone },
+        delivery,
+        address: delivery === "delivery" ? `${formData.address}, ${formData.city}` : "Pickup",
+        notes: formData.notes,
+        total,
+        date: new Date().toISOString(),
+        status: "new",
+      };
+      onSuccess(order);
+    }
+  };
+
+  return (
+    <div>
+      <label className="form-label" style={{ display: "block", marginBottom: 8 }}>Payment Details</label>
+      <div style={{ border: "1.5px solid #e8d5d5", borderRadius: "var(--radius-sm)", padding: "16px", marginBottom: 16, background: "white" }}>
+        <PaymentElement />
+      </div>
+      {error && <p style={{ color: "#c53030", fontSize: 13, marginBottom: 12 }}>{error}</p>}
+      <button className="pay-btn" onClick={handlePay} disabled={processing || !stripe}>
+        {processing ? "Processing..." : `Pay $${total.toFixed(2)}`}
+      </button>
+    </div>
+  );
+}
+
 function CheckoutPage({ cart, onSuccess, goBack }) {
   const [delivery, setDelivery] = useState("pickup");
-  const [form, setForm] = useState({ name: "", email: "", phone: "", address: "", city: "", notes: "", cardNum: "", cardExp: "", cardCvc: "" });
-  const [processing, setProcessing] = useState(false);
+  const [form, setForm] = useState({ name: "", email: "", phone: "", address: "", city: "", notes: "" });
+  const [clientSecret, setClientSecret] = useState(null);
+  const [formError, setFormError] = useState("");
   const subtotal = cart.reduce((s, i) => s + i.price * i.qty, 0);
   const fee = delivery === "delivery" ? DELIVERY_FEE : 0;
   const total = subtotal + fee;
 
   const update = (k, v) => setForm(f => ({ ...f, [k]: v }));
 
-  const handlePay = () => {
-    if (!form.name || !form.email || !form.phone) return alert("Please fill in your contact details.");
-    if (delivery === "delivery" && !form.address) return alert("Please enter a delivery address.");
-    if (!form.cardNum || !form.cardExp || !form.cardCvc) return alert("Please enter your card details.");
-    setProcessing(true);
-    // Simulate Stripe payment
-    setTimeout(() => {
-      const order = {
-        id: "SM-" + Date.now().toString(36).toUpperCase(),
-        items: cart.map(i => ({ name: i.name, qty: i.qty, price: i.price })),
-        customer: { name: form.name, email: form.email, phone: form.phone },
-        delivery,
-        address: delivery === "delivery" ? `${form.address}, ${form.city}` : "Pickup",
-        notes: form.notes,
-        total,
-        date: new Date().toISOString(),
-        status: "new",
-      };
-      onSuccess(order);
-    }, 2000);
+  const handleContinue = async () => {
+    if (!form.name || !form.email || !form.phone) return setFormError("Please fill in your contact details.");
+    if (delivery === "delivery" && !form.address) return setFormError("Please enter a delivery address.");
+    setFormError("");
+    const res = await fetch("/api/create-payment-intent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ amount: total }),
+    });
+    const { clientSecret } = await res.json();
+    setClientSecret(clientSecret);
   };
 
   return (
@@ -966,12 +1023,12 @@ function CheckoutPage({ cart, onSuccess, goBack }) {
 
       {/* Delivery Toggle */}
       <div className="delivery-toggle">
-        <div className={`delivery-opt ${delivery === "pickup" ? "selected" : ""}`} onClick={() => setDelivery("pickup")}>
+        <div className={`delivery-opt ${delivery === "pickup" ? "selected" : ""}`} onClick={() => { setDelivery("pickup"); setClientSecret(null); }}>
           <span className="delivery-opt-icon">🏠</span>
           <div className="delivery-opt-label">Pickup</div>
           <div className="delivery-opt-sub">Free — collect from Dafne</div>
         </div>
-        <div className={`delivery-opt ${delivery === "delivery" ? "selected" : ""}`} onClick={() => setDelivery("delivery")}>
+        <div className={`delivery-opt ${delivery === "delivery" ? "selected" : ""}`} onClick={() => { setDelivery("delivery"); setClientSecret(null); }}>
           <span className="delivery-opt-icon">🚗</span>
           <div className="delivery-opt-label">Delivery</div>
           <div className="delivery-opt-sub">${DELIVERY_FEE.toFixed(2)} delivery fee</div>
@@ -1028,19 +1085,15 @@ function CheckoutPage({ cart, onSuccess, goBack }) {
         <div className="order-line total"><span>Total</span><span>${total.toFixed(2)}</span></div>
       </div>
 
-      {/* Card (Stripe placeholder) */}
-      <label className="form-label">Payment Details</label>
-      <div className="stripe-card">
-        <input className="form-input" placeholder="Card number (e.g. 4242 4242 4242 4242)" value={form.cardNum} onChange={e => update("cardNum", e.target.value)} />
-        <div className="stripe-row">
-          <input className="form-input" placeholder="MM / YY" value={form.cardExp} onChange={e => update("cardExp", e.target.value)} />
-          <input className="form-input" placeholder="CVC" value={form.cardCvc} onChange={e => update("cardCvc", e.target.value)} />
-        </div>
-      </div>
-
-      <button className="pay-btn" onClick={handlePay} disabled={processing}>
-        {processing ? "Processing..." : `Pay $${total.toFixed(2)}`}
-      </button>
+      {/* Payment */}
+      {formError && <p style={{ color: "#c53030", fontSize: 13, marginBottom: 12 }}>{formError}</p>}
+      {!clientSecret ? (
+        <button className="pay-btn" onClick={handleContinue}>Continue to Payment</button>
+      ) : (
+        <Elements stripe={stripePromise} options={{ clientSecret }}>
+          <StripePaymentForm total={total} onSuccess={onSuccess} formData={form} delivery={delivery} cart={cart} />
+        </Elements>
+      )}
     </div>
   );
 }
