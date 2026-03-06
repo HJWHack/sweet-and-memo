@@ -1,10 +1,9 @@
 import { useState, useEffect, useCallback, useRef, createContext, useContext } from "react";
+import { supabase } from "./supabase";
 
 /* ─────────────────────────── CONSTANTS & DATA ─────────────────────────── */
 const ADMIN_PASS = "dafne2026";
 const DELIVERY_FEE = 8.00;
-const STORAGE_KEY = "sweetmemo-products";
-const ORDERS_KEY = "sweetmemo-orders";
 const LOGO_URL = "/logo.png";
 
 const DEFAULT_PRODUCTS = [
@@ -25,15 +24,50 @@ const DEFAULT_PRODUCTS = [
 /* ─────────────────────────── CONTEXT ─────────────────────────── */
 const AppContext = createContext();
 
-/* ─────────────────────────── STORAGE HELPERS ─────────────────────────── */
-const loadFromStorage = async (key, fallback) => {
-  try {
-    const raw = localStorage.getItem(key);
-    return raw ? JSON.parse(raw) : fallback;
-  } catch { return fallback; }
+/* ─────────────────────────── SUPABASE HELPERS ─────────────────────────── */
+const fetchProducts = async () => {
+  const { data, error } = await supabase.from("products").select("*").order("id");
+  if (error) { console.error("fetchProducts error:", error); return null; }
+  return data;
 };
-const saveToStorage = async (key, data) => {
-  try { localStorage.setItem(key, JSON.stringify(data)); } catch (e) { console.error("Storage save error:", e); }
+
+const fetchOrders = async () => {
+  const { data, error } = await supabase.from("orders").select("*").order("created_at", { ascending: false });
+  if (error) { console.error("fetchOrders error:", error); return []; }
+  return data;
+};
+
+const upsertProduct = async (product) => {
+  const { id, ...fields } = product;
+  if (id) {
+    const { data, error } = await supabase.from("products").update(fields).eq("id", id).select().single();
+    if (error) console.error("upsertProduct error:", error);
+    return data;
+  } else {
+    const { data, error } = await supabase.from("products").insert(fields).select().single();
+    if (error) console.error("upsertProduct error:", error);
+    return data;
+  }
+};
+
+const removeProduct = async (id) => {
+  const { error } = await supabase.from("products").delete().eq("id", id);
+  if (error) console.error("removeProduct error:", error);
+};
+
+const insertOrder = async (order) => {
+  const { data, error } = await supabase.from("orders").insert({
+    customer_name: order.customer.name,
+    email: order.customer.email,
+    phone: order.customer.phone,
+    address: order.address,
+    delivery: order.delivery,
+    notes: order.notes,
+    items: order.items,
+    total: order.total,
+  }).select().single();
+  if (error) console.error("insertOrder error:", error);
+  return data;
 };
 
 /* ─────────────────────────── STYLES ─────────────────────────── */
@@ -1156,35 +1190,28 @@ function AdminPage({ products, setProducts, orders }) {
     </div>
   );
 
-  const saveProduct = (data) => {
-    setProducts(prev => {
-      let next;
-      if (editing === "new") {
-        next = [...prev, { ...data, id: Date.now() }];
-      } else {
-        next = prev.map(p => p.id === editing.id ? { ...data, id: editing.id } : p);
-      }
-      saveToStorage(STORAGE_KEY, next);
-      return next;
-    });
+  const saveProduct = async (data) => {
+    const saved = await upsertProduct(editing === "new" ? data : { ...data, id: editing.id });
+    if (!saved) return;
+    if (editing === "new") {
+      setProducts(prev => [...prev, saved]);
+    } else {
+      setProducts(prev => prev.map(p => p.id === saved.id ? saved : p));
+    }
     setEditing(null);
   };
 
-  const deleteProduct = (id) => {
+  const deleteProduct = async (id) => {
     if (!confirm("Delete this product?")) return;
-    setProducts(prev => {
-      const next = prev.filter(p => p.id !== id);
-      saveToStorage(STORAGE_KEY, next);
-      return next;
-    });
+    await removeProduct(id);
+    setProducts(prev => prev.filter(p => p.id !== id));
   };
 
-  const toggleAvail = (id) => {
-    setProducts(prev => {
-      const next = prev.map(p => p.id === id ? { ...p, available: !p.available } : p);
-      saveToStorage(STORAGE_KEY, next);
-      return next;
-    });
+  const toggleAvail = async (id) => {
+    const product = products.find(p => p.id === id);
+    const saved = await upsertProduct({ ...product, available: !product.available });
+    if (!saved) return;
+    setProducts(prev => prev.map(p => p.id === id ? saved : p));
   };
 
   return (
@@ -1295,13 +1322,12 @@ export default function App() {
   const [lastOrder, setLastOrder] = useState(null);
   const [loaded, setLoaded] = useState(false);
 
-  // Load persisted data
+  // Load data from Supabase
   useEffect(() => {
     (async () => {
-      const savedProducts = await loadFromStorage(STORAGE_KEY, null);
-      if (savedProducts && savedProducts.length) setProducts(savedProducts);
-      const savedOrders = await loadFromStorage(ORDERS_KEY, []);
-      setOrders(savedOrders);
+      const [dbProducts, dbOrders] = await Promise.all([fetchProducts(), fetchOrders()]);
+      if (dbProducts && dbProducts.length) setProducts(dbProducts);
+      if (dbOrders) setOrders(dbOrders);
       setLoaded(true);
     })();
   }, []);
@@ -1330,9 +1356,8 @@ export default function App() {
   const cartCount = cart.reduce((s, i) => s + i.qty, 0);
 
   const handleOrderSuccess = async (order) => {
-    const newOrders = [...orders, order];
-    setOrders(newOrders);
-    await saveToStorage(ORDERS_KEY, newOrders);
+    const saved = await insertOrder(order);
+    setOrders(prev => [saved || order, ...prev]);
     setLastOrder(order);
     setCart([]);
     setPage("success");
